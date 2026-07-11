@@ -2,6 +2,7 @@ const { PriorityQueue } = require('./priorityQueue');
 const { ResourcePool } = require('./bankersAlgorithm');
 const { dispatchNext } = require('./ambulanceDispatch');
 const { summarize } = require('./metrics');
+const { createAlgorithm, getAvailableAlgorithms } = require('./scheduler');
 
 // Hospital anchor point (Chattogram, Bangladesh) -- used to seed ambulance
 // starting positions and as the map center on the frontend.
@@ -72,11 +73,15 @@ function deadlineMinutesFor(severity) {
 
 class HospitalStore {
   constructor() {
-    this.waitingQueue = new PriorityQueue(); // patients not yet admitted
+    this.activeScheduler = createAlgorithm('preemptivePriority', {
+      agingIntervalMin: 5,
+      agingStep: 0.5,
+    });
+    this.waitingQueue = new PriorityQueue(this.activeScheduler.sort); // patients not yet admitted
     this.admitted = new Map(); // patientId -> patient record (holding resources)
     this.resourcePool = new ResourcePool({ beds: 10, doctors: 5, icu: 3, ventilators: 2 });
 
-    this.callsQueue = new PriorityQueue(); // pending ambulance calls
+    this.callsQueue = new PriorityQueue(); // pending ambulance calls (always uses default preemptive priority aging)
     this.ambulances = [
       { id: 'amb-1', name: 'Ambulance 1', lat: 22.365, lng: 91.795, speedKmh: 45, status: 'available' },
       { id: 'amb-2', name: 'Ambulance 2', lat: 22.34, lng: 91.81, speedKmh: 45, status: 'available' },
@@ -109,6 +114,28 @@ class HospitalStore {
   log(message) {
     this.eventLog.unshift({ id: this.nextId('log'), message, at: Date.now() });
     this.eventLog = this.eventLog.slice(0, 50);
+  }
+
+  // ---------- Scheduler ----------
+
+  getSchedulerConfig() {
+    return {
+      activeAlgorithm: this.activeScheduler.algorithmName,
+      availableAlgorithms: getAvailableAlgorithms(),
+      params: { ...this.activeScheduler.params },
+    };
+  }
+
+  setScheduler(algorithmName, params) {
+    this.activeScheduler = createAlgorithm(algorithmName, params);
+    this.waitingQueue.setSorter(this.activeScheduler.sort);
+    this.log(
+      'Scheduler changed to ' +
+        this.activeScheduler.name +
+        ' (' +
+        algorithmName +
+        ')'
+    );
   }
 
   // ---------- Patients ----------
@@ -160,6 +187,8 @@ class HospitalStore {
     this.admissionLog = this.admissionLog.slice(0, 100);
 
     if (!result.granted) {
+      var entry = this.waitingQueue.get(top.id);
+      if (entry) entry.lastServedAt = Date.now();
       this.log(
         `Admission of ${top.name} BLOCKED (${result.reason}) -- staying on waiting list`
       );
@@ -435,6 +464,7 @@ class HospitalStore {
       })),
       metrics: summarize(this.completedEvents, this.ambulances),
       eventLog: this.eventLog,
+      scheduler: this.getSchedulerConfig(),
     };
   }
 }

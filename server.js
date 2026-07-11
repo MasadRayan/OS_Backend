@@ -22,6 +22,23 @@ const router = express.Router();
 
 router.get('/health', (_req, res) => res.json({ ok: true }));
 
+router.get('/config/scheduler', (_req, res) => {
+  res.json(store.getSchedulerConfig());
+});
+
+router.put('/config/scheduler', (req, res) => {
+  var algorithm = req.body && req.body.algorithm;
+  if (!algorithm) {
+    return res.status(400).json({ error: 'algorithm is required' });
+  }
+  try {
+    store.setScheduler(algorithm, req.body.params);
+    res.json(store.getSchedulerConfig());
+  } catch (e) {
+    res.status(400).json({ error: 'unknown algorithm' });
+  }
+});
+
 router.get('/state', (_req, res) => {
   res.json(store.getState());
 });
