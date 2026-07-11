@@ -1,0 +1,14 @@
+{
+  "name": "triage-dispatch-backend",
+  "version": "1.0.0",
+  "description": "Priority scheduling (with aging), Banker's Algorithm resource admission, and priority-first ambulance dispatch for an emergency triage system.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
+}
