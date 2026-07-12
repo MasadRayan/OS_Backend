@@ -44,14 +44,18 @@ function etaMinutes(distanceKm, speedKmh) {
 }
 
 /**
- * Given the top (most urgent) pending call and a list of ambulances,
- * choose the best available ambulance by lowest ETA.
+ * Given a call and a list of ambulances, choose the best available ambulance
+ * by lowest ETA. For severity 4-5 (minor / non-urgent) calls, ALS-type
+ * ambulances are preferred; if none is available, BLS is used as fallback.
  * Returns { ambulance, distanceKm, etaMin } or null if none available.
  */
 function findBestAmbulance(call, ambulances) {
+  const preferALS = call.basePriority >= 4;
   let best = null;
+
   for (const amb of ambulances) {
     if (amb.status !== 'available') continue;
+    if (preferALS && amb.type !== 'als') continue;
     const distanceKm = haversineKm(
       { lat: amb.lat, lng: amb.lng },
       { lat: call.lat, lng: call.lng }
@@ -61,6 +65,22 @@ function findBestAmbulance(call, ambulances) {
       best = { ambulance: amb, distanceKm, etaMin };
     }
   }
+
+  // ALS preference fallback: if no ALS available, try BLS
+  if (!best && preferALS) {
+    for (const amb of ambulances) {
+      if (amb.status !== 'available') continue;
+      const distanceKm = haversineKm(
+        { lat: amb.lat, lng: amb.lng },
+        { lat: call.lat, lng: call.lng }
+      );
+      const etaMin = etaMinutes(distanceKm, amb.speedKmh);
+      if (!best || etaMin < best.etaMin) {
+        best = { ambulance: amb, distanceKm, etaMin };
+      }
+    }
+  }
+
   return best;
 }
 

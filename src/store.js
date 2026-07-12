@@ -1,6 +1,6 @@
 const { PriorityQueue } = require('./priorityQueue');
 const { ResourcePool } = require('./bankersAlgorithm');
-const { dispatchNext } = require('./ambulanceDispatch');
+const { dispatchNext, haversineKm, etaMinutes } = require('./ambulanceDispatch');
 const { summarize } = require('./metrics');
 const { createAlgorithm, getAvailableAlgorithms } = require('./scheduler');
 
@@ -83,12 +83,19 @@ class HospitalStore {
 
     this.callsQueue = new PriorityQueue(); // pending ambulance calls (always uses default preemptive priority aging)
     this.ambulances = [
-      { id: 'amb-1', name: 'Ambulance 1', lat: 22.365, lng: 91.795, speedKmh: 45, status: 'available' },
-      { id: 'amb-2', name: 'Ambulance 2', lat: 22.34, lng: 91.81, speedKmh: 45, status: 'available' },
-      { id: 'amb-3', name: 'Ambulance 3', lat: 22.372, lng: 91.765, speedKmh: 45, status: 'available' },
-      { id: 'amb-4', name: 'Ambulance 4', lat: 22.33, lng: 91.77, speedKmh: 45, status: 'available' },
+      { id: 'amb-1', name: 'Ambulance 1', lat: 22.365, lng: 91.795, speedKmh: 45, status: 'available', type: 'als', equipment: { defib: true, ventilator: true, stretcher: true, meds: true }, crew: [{ name: 'Rahim', role: 'paramedic', onShift: true }, { name: 'Karim', role: 'driver', onShift: true }], utilization: 0 },
+      { id: 'amb-2', name: 'Ambulance 2', lat: 22.34, lng: 91.81, speedKmh: 45, status: 'available', type: 'bls', equipment: { defib: false, ventilator: false, stretcher: true, meds: false }, crew: [{ name: 'Fatima', role: 'emt', onShift: true }, { name: 'Hasan', role: 'driver', onShift: true }], utilization: 0 },
+      { id: 'amb-3', name: 'Ambulance 3', lat: 22.372, lng: 91.765, speedKmh: 45, status: 'available', type: 'als', equipment: { defib: true, ventilator: true, stretcher: true, meds: true }, crew: [{ name: 'Nadia', role: 'paramedic', onShift: true }, { name: 'Tanvir', role: 'driver', onShift: false }], utilization: 0 },
+      { id: 'amb-4', name: 'Ambulance 4', lat: 22.33, lng: 91.77, speedKmh: 45, status: 'available', type: 'bls', equipment: { defib: false, ventilator: false, stretcher: true, meds: false }, crew: [{ name: 'Shamim', role: 'emt', onShift: true }, { name: 'Jahid', role: 'driver', onShift: true }], utilization: 0 },
     ];
-    this.activeTrips = new Map(); // ambulanceId -> { call, distanceKm, etaMin, startedAt }
+    this.activeTrips = new Map(); // ambulanceId -> full trip object
+
+    this.hospitals = [
+      { id: 'hosp-1', name: 'City General Hospital', lat: 22.3569, lng: 91.7832, bedsAvailable: 10, capacity: 50 },
+      { id: 'hosp-2', name: 'Chittagong Medical Center', lat: 22.335, lng: 91.832, bedsAvailable: 7, capacity: 40 },
+      { id: 'hosp-3', name: 'Parkview Hospital', lat: 22.375, lng: 91.755, bedsAvailable: 5, capacity: 30 },
+    ];
+    this.tripHistory = [];
 
     this.completedEvents = []; // for metrics: {type, severity, waitMinutes, completedAt}
     this.eventLog = []; // human-readable feed for the UI
@@ -305,10 +312,11 @@ class HospitalStore {
     }
   }
 
-  /** Called on every server tick: escalation, department progression, ambulance dispatch. */
+  /** Called on every server tick: escalation, department progression, ambulance lifecycle, dispatch. */
   tick() {
     this._escalateWaitingPatients();
     this._progressAdmittedPatients();
+    this._advanceTrips();
     this.runDispatchLoop();
   }
 
@@ -337,13 +345,50 @@ class HospitalStore {
     let assignment = dispatchNext(this.callsQueue, this.ambulances);
     while (assignment) {
       const { call, ambulance, distanceKm, etaMin } = assignment;
+      const hospital = this._findNearestHospital(call.lat, call.lng);
+      const distanceToHospital = haversineKm(
+        { lat: call.lat, lng: call.lng },
+        { lat: hospital.lat, lng: hospital.lng }
+      );
+      const etaToHospitalMin = etaMinutes(distanceToHospital, ambulance.speedKmh);
+      const now = Date.now();
+      const tripId = this.nextId('trip');
+
+      const routePolyline = [
+        [ambulance.lat, ambulance.lng],
+        [(ambulance.lat + call.lat) / 2, (ambulance.lng + call.lng) / 2],
+        [call.lat, call.lng],
+      ];
+
       ambulance.status = 'dispatched';
-      this.activeTrips.set(ambulance.id, {
-        call,
+
+      const trip = {
+        id: tripId,
+        status: 'dispatched',
+        dispatchedAt: now,
+        enRouteAt: null,
+        onSceneAt: null,
+        transportingAt: null,
+        arrivedAt: null,
+        call: {
+          callerName: call.callerName,
+          note: call.note,
+          basePriority: call.basePriority,
+          lat: call.lat,
+          lng: call.lng,
+          arrivalTime: call.arrivalTime,
+        },
+        hospital: { id: hospital.id, name: hospital.name, lat: hospital.lat, lng: hospital.lng },
+        routePolyline,
+        ambulanceId: ambulance.id,
         distanceKm,
         etaMin,
-        startedAt: Date.now(),
-      });
+        etaToSceneSec: etaMin * 60,
+        etaToHospitalSec: etaToHospitalMin * 60,
+      };
+
+      this.activeTrips.set(ambulance.id, trip);
+
       this.log(
         `${ambulance.name} dispatched to ${call.callerName} (${SEVERITY_LABELS[call.basePriority]}, ETA ${etaMin.toFixed(1)}m)`
       );
@@ -366,30 +411,250 @@ class HospitalStore {
     return assignments;
   }
 
-  /** Mark an ambulance's trip complete (arrived + patient handed off); ambulance returns to service. */
+  /** Advance a trip to arrived and return the ambulance to service. */
   completeTrip(ambulanceId) {
     const trip = this.activeTrips.get(ambulanceId);
     const ambulance = this.ambulances.find((a) => a.id === ambulanceId);
     if (!trip || !ambulance) return { ok: false, reason: 'no_active_trip' };
 
-    const waitMinutes = Math.round((Date.now() - trip.call.arrivalTime) / 60000);
-    this.completedEvents.push({
-      type: 'ambulance',
+    const now = Date.now();
+    trip.status = 'arrived';
+    trip.arrivedAt = now;
+    this._finishTrip(ambulanceId, trip);
+    return { ok: true };
+  }
+
+  /** Cancel the current trip and return ambulance to service. Call stays in queue if still present (it was already dequeued on dispatch). */
+  cancelTrip(ambulanceId, reason) {
+    const trip = this.activeTrips.get(ambulanceId);
+    const ambulance = this.ambulances.find((a) => a.id === ambulanceId);
+    if (!trip || !ambulance) return { ok: false, reason: 'no_active_trip' };
+
+    this.tripHistory.push({
+      id: trip.id,
+      ambulanceId,
+      ambulanceName: ambulance.name,
+      callerName: trip.call.callerName,
+      note: trip.call.note,
       severity: trip.call.basePriority,
-      waitMinutes,
-      completedAt: Date.now(),
+      status: 'cancelled',
+      dispatchedAt: new Date(trip.dispatchedAt).toISOString(),
+      enRouteAt: trip.enRouteAt ? new Date(trip.enRouteAt).toISOString() : null,
+      onSceneAt: null,
+      transportingAt: null,
+      arrivedAt: null,
+      responseTimeMin: 0,
+      hospitalId: trip.hospital.id,
+      hospitalName: trip.hospital.name,
     });
 
-    // Ambulance "returns" to the hospital and becomes available again.
     ambulance.lat = HOSPITAL.lat + (Math.random() - 0.5) * 0.02;
     ambulance.lng = HOSPITAL.lng + (Math.random() - 0.5) * 0.02;
     ambulance.status = 'available';
     this.activeTrips.delete(ambulanceId);
-    this.log(`${ambulance.name} completed transport of ${trip.call.callerName}, back in service`);
+    this.log(`${ambulance.name} trip cancelled${reason ? ': ' + reason : ''}`);
 
-    // Freeing an ambulance may let another queued call be served.
     this.runDispatchLoop();
     return { ok: true };
+  }
+
+  /** Reassign a trip from one ambulance to another. */
+  reassignTrip(ambulanceId, targetAmbulanceId) {
+    const sourceTrip = this.activeTrips.get(ambulanceId);
+    const sourceAmbulance = this.ambulances.find((a) => a.id === ambulanceId);
+    const targetAmbulance = this.ambulances.find((a) => a.id === targetAmbulanceId);
+
+    if (!sourceTrip || !sourceAmbulance) return { ok: false, reason: 'no_active_trip' };
+    if (!targetAmbulance) return { ok: false, reason: 'target_not_found' };
+    if (targetAmbulance.status !== 'available') return { ok: false, reason: 'target_not_available' };
+
+    const call = sourceTrip.call;
+    this.cancelTrip(ambulanceId, 'Reassigned');
+
+    const distanceKm = haversineKm(
+      { lat: targetAmbulance.lat, lng: targetAmbulance.lng },
+      { lat: call.lat, lng: call.lng }
+    );
+    const etaMin = etaMinutes(distanceKm, targetAmbulance.speedKmh);
+    const hospital = this._findNearestHospital(call.lat, call.lng);
+    const distanceToHospital = haversineKm(
+      { lat: call.lat, lng: call.lng },
+      { lat: hospital.lat, lng: hospital.lng }
+    );
+    const etaToHospitalMin = etaMinutes(distanceToHospital, targetAmbulance.speedKmh);
+    const now = Date.now();
+    const tripId = this.nextId('trip');
+
+    const routePolyline = [
+      [targetAmbulance.lat, targetAmbulance.lng],
+      [(targetAmbulance.lat + call.lat) / 2, (targetAmbulance.lng + call.lng) / 2],
+      [call.lat, call.lng],
+    ];
+
+    targetAmbulance.status = 'dispatched';
+
+    const trip = {
+      id: tripId,
+      status: 'dispatched',
+      dispatchedAt: now,
+      enRouteAt: null,
+      onSceneAt: null,
+      transportingAt: null,
+      arrivedAt: null,
+      call: { callerName: call.callerName, note: call.note, basePriority: call.basePriority, lat: call.lat, lng: call.lng, arrivalTime: call.arrivalTime },
+      hospital: { id: hospital.id, name: hospital.name, lat: hospital.lat, lng: hospital.lng },
+      routePolyline,
+      ambulanceId: targetAmbulance.id,
+      distanceKm,
+      etaMin,
+      etaToSceneSec: etaMin * 60,
+      etaToHospitalSec: etaToHospitalMin * 60,
+    };
+
+    this.activeTrips.set(targetAmbulance.id, trip);
+    this.log(`Trip reassigned from ${sourceAmbulance.name} to ${targetAmbulance.name} for ${call.callerName}`);
+
+    return { ok: true };
+  }
+
+  /** Return the list of hospitals. */
+  getHospitals() {
+    return this.hospitals;
+  }
+
+  /** Return paginated, filterable trip history. */
+  getTripHistory({ from, to, ambulanceId, severity, status, page = 1, limit = 50 } = {}) {
+    let filtered = this.tripHistory;
+    if (from) filtered = filtered.filter((t) => new Date(t.dispatchedAt) >= new Date(from));
+    if (to) filtered = filtered.filter((t) => new Date(t.dispatchedAt) <= new Date(to));
+    if (ambulanceId) filtered = filtered.filter((t) => t.ambulanceId === ambulanceId);
+    if (severity) filtered = filtered.filter((t) => t.severity === Number(severity));
+    if (status) filtered = filtered.filter((t) => t.status === status);
+
+    const total = filtered.length;
+    const startIdx = (page - 1) * limit;
+    const trips = filtered.slice(startIdx, startIdx + limit);
+
+    return { trips, total, page: Number(page), limit: Number(limit) };
+  }
+
+  /** Pick the hospital closest to a given lat/lng. */
+  _findNearestHospital(lat, lng) {
+    let nearest = this.hospitals[0];
+    let minDist = Infinity;
+    for (const h of this.hospitals) {
+      const d = haversineKm({ lat, lng }, { lat: h.lat, lng: h.lng });
+      if (d < minDist) {
+        minDist = d;
+        nearest = h;
+      }
+    }
+    return nearest;
+  }
+
+  /** Finish a trip: record history, completed events, mark ambulance available, try next dispatch. */
+  _finishTrip(ambulanceId, trip) {
+    const ambulance = this.ambulances.find((a) => a.id === ambulanceId);
+    if (!ambulance) return;
+
+    const responseTimeMin = trip.onSceneAt
+      ? Math.round((trip.onSceneAt - trip.dispatchedAt) / 60000)
+      : 0;
+    const waitMinutes = Math.round((Date.now() - trip.call.arrivalTime) / 60000);
+
+    this.completedEvents.push({
+      type: 'ambulance',
+      severity: trip.call.basePriority,
+      waitMinutes,
+      responseMinutes: responseTimeMin,
+      completedAt: Date.now(),
+    });
+
+    this.tripHistory.push({
+      id: trip.id,
+      ambulanceId,
+      ambulanceName: ambulance.name,
+      callerName: trip.call.callerName,
+      note: trip.call.note,
+      severity: trip.call.basePriority,
+      status: 'arrived',
+      dispatchedAt: new Date(trip.dispatchedAt).toISOString(),
+      enRouteAt: trip.enRouteAt ? new Date(trip.enRouteAt).toISOString() : null,
+      onSceneAt: trip.onSceneAt ? new Date(trip.onSceneAt).toISOString() : null,
+      transportingAt: trip.transportingAt ? new Date(trip.transportingAt).toISOString() : null,
+      arrivedAt: new Date(trip.arrivedAt || Date.now()).toISOString(),
+      responseTimeMin,
+      hospitalId: trip.hospital.id,
+      hospitalName: trip.hospital.name,
+    });
+
+    ambulance.lat = trip.hospital.lat + (Math.random() - 0.5) * 0.002;
+    ambulance.lng = trip.hospital.lng + (Math.random() - 0.5) * 0.002;
+    ambulance.status = 'available';
+    this.activeTrips.delete(ambulanceId);
+    this.log(`${ambulance.name} completed transport of ${trip.call.callerName}, back in service`);
+
+    this.runDispatchLoop();
+  }
+
+  /** Auto-advance trip statuses on each tick: dispatched -> en_route -> on_scene -> transporting -> arrived. */
+  _advanceTrips() {
+    const now = Date.now();
+    for (const [ambulanceId, trip] of this.activeTrips) {
+      const ambulance = this.ambulances.find((a) => a.id === ambulanceId);
+      if (!ambulance) continue;
+
+      if (trip.status === 'dispatched') {
+        const elapsedSec = (now - trip.dispatchedAt) / 1000;
+        if (elapsedSec >= 5) {
+          trip.status = 'en_route';
+          trip.enRouteAt = now;
+          this.log(`${ambulance.name} is now en route to ${trip.call.callerName}`);
+        }
+      } else if (trip.status === 'en_route') {
+        const elapsedSec = (now - trip.enRouteAt) / 1000;
+        if (elapsedSec >= trip.etaToSceneSec) {
+          trip.status = 'on_scene';
+          trip.onSceneAt = now;
+          ambulance.lat = trip.call.lat;
+          ambulance.lng = trip.call.lng;
+          this.log(`${ambulance.name} arrived on scene for ${trip.call.callerName}`);
+        } else {
+          this._moveAmbulanceAlongRoute(ambulance, trip, elapsedSec, trip.etaToSceneSec);
+        }
+      } else if (trip.status === 'on_scene') {
+        const elapsedSec = (now - trip.onSceneAt) / 1000;
+        if (elapsedSec >= 10) {
+          trip.status = 'transporting';
+          trip.transportingAt = now;
+          trip.routePolyline = [
+            [trip.call.lat, trip.call.lng],
+            [(trip.call.lat + trip.hospital.lat) / 2, (trip.call.lng + trip.hospital.lng) / 2],
+            [trip.hospital.lat, trip.hospital.lng],
+          ];
+          trip.etaMin = trip.etaToHospitalSec / 60;
+          this.log(`${ambulance.name} transporting ${trip.call.callerName} to ${trip.hospital.name}`);
+        }
+      } else if (trip.status === 'transporting') {
+        const elapsedSec = (now - trip.transportingAt) / 1000;
+        if (elapsedSec >= trip.etaToHospitalSec) {
+          trip.status = 'arrived';
+          trip.arrivedAt = now;
+          this._finishTrip(ambulanceId, trip);
+        } else {
+          this._moveAmbulanceAlongRoute(ambulance, trip, elapsedSec, trip.etaToHospitalSec);
+        }
+      }
+    }
+  }
+
+  /** Interpolate ambulance position along its route polyline. */
+  _moveAmbulanceAlongRoute(ambulance, trip, elapsedSec, totalSec) {
+    const from = trip.routePolyline[0];
+    const to = trip.routePolyline[trip.routePolyline.length - 1];
+    const ratio = Math.min(1, totalSec > 0 ? elapsedSec / totalSec : 0);
+    ambulance.lat = from[0] + (to[0] - from[0]) * ratio;
+    ambulance.lng = from[1] + (to[1] - from[1]) * ratio;
   }
 
   // ---------- Analysis ----------
@@ -421,6 +686,45 @@ class HospitalStore {
         return acc;
       }, {});
 
+    // avgResponseTimeBySeverity from trip history
+    const arrived = this.tripHistory.filter((t) => t.status === 'arrived' && t.responseTimeMin > 0);
+    const severityMap = {};
+    for (const t of arrived) {
+      if (!severityMap[t.severity]) severityMap[t.severity] = [];
+      severityMap[t.severity].push(t.responseTimeMin);
+    }
+    const avgResponseTimeBySeverity = Object.entries(severityMap)
+      .map(([severity, times]) => ({
+        severity: Number(severity),
+        avgMinutes: Number((times.reduce((a, b) => a + b, 0) / times.length).toFixed(1)),
+        count: times.length,
+      }))
+      .sort((a, b) => a.severity - b.severity);
+
+    // callsByHour from trip history
+    const hourMap = {};
+    for (const t of arrived) {
+      const hour = new Date(t.dispatchedAt).getHours();
+      if (!hourMap[hour]) hourMap[hour] = { count: 0, totalMin: 0 };
+      hourMap[hour].count += 1;
+      hourMap[hour].totalMin += t.responseTimeMin;
+    }
+    const callsByHour = Object.entries(hourMap)
+      .map(([hour, d]) => ({
+        hour: Number(hour),
+        count: d.count,
+        avgResponseMin: Number((d.totalMin / d.count).toFixed(1)),
+      }))
+      .sort((a, b) => a.hour - b.hour);
+
+    // callOutcomes
+    const arrivedCount = this.tripHistory.filter((t) => t.status === 'arrived').length;
+    const cancelledCount = this.tripHistory.filter((t) => t.status === 'cancelled').length;
+    const callOutcomes = [
+      { label: 'Transported', value: arrivedCount || 0 },
+      { label: 'Cancelled', value: cancelledCount || 0 },
+    ];
+
     return {
       history: this.metricsHistory,
       dispatchLog: this.dispatchLog.slice(0, 25),
@@ -440,6 +744,9 @@ class HospitalStore {
             (this.dispatchLog.reduce((sum, d) => sum + d.etaMin, 0) / this.dispatchLog.length).toFixed(1)
           )
         : 0,
+      avgResponseTimeBySeverity,
+      callsByHour,
+      callOutcomes,
     };
   }
 
@@ -447,6 +754,25 @@ class HospitalStore {
 
   getState() {
     const now = Date.now();
+    const totalUnits = this.ambulances.length;
+    const available = this.ambulances.filter((a) => a.status === 'available').length;
+    const dispatched = this.ambulances.filter((a) => a.status === 'dispatched' || a.status === 'en_route').length;
+    const onScene = this.ambulances.filter((a) => a.status === 'on_scene').length;
+
+    for (const amb of this.ambulances) {
+      amb.utilization = amb.status !== 'available' ? 1 : 0;
+    }
+
+    const completedTrips = this.tripHistory.filter((t) => t.status === 'arrived' && t.responseTimeMin > 0);
+    const avgResponseTimeMin = completedTrips.length
+      ? Number((completedTrips.reduce((sum, t) => sum + t.responseTimeMin, 0) / completedTrips.length).toFixed(1))
+      : 0;
+
+    const callSnapshots = this.callsQueue.snapshot(now);
+    const avgWaitTimeMin = callSnapshots.length
+      ? Number((callSnapshots.reduce((sum, c) => sum + (c.waitMinutes || 0), 0) / callSnapshots.length).toFixed(1))
+      : 0;
+
     return {
       hospital: HOSPITAL,
       severityLabels: SEVERITY_LABELS,
@@ -457,11 +783,35 @@ class HospitalStore {
         stageIsFinal: p.departmentSequence.indexOf(p.department) === p.departmentSequence.length - 1,
       })),
       resources: this.resourcePool.state(),
-      callsQueue: this.callsQueue.snapshot(now),
-      ambulances: this.ambulances.map((a) => ({
-        ...a,
-        trip: this.activeTrips.get(a.id) || null,
-      })),
+      callsQueue: callSnapshots,
+      ambulances: this.ambulances.map((a) => {
+        const trip = this.activeTrips.get(a.id);
+        return {
+          ...a,
+          trip: trip
+            ? {
+                ...trip,
+                call: { ...trip.call },
+                hospital: { ...trip.hospital },
+                routePolyline: [...trip.routePolyline],
+                dispatchedAt: new Date(trip.dispatchedAt).toISOString(),
+                enRouteAt: trip.enRouteAt ? new Date(trip.enRouteAt).toISOString() : null,
+                onSceneAt: trip.onSceneAt ? new Date(trip.onSceneAt).toISOString() : null,
+                transportingAt: trip.transportingAt ? new Date(trip.transportingAt).toISOString() : null,
+                arrivedAt: trip.arrivedAt ? new Date(trip.arrivedAt).toISOString() : null,
+              }
+            : null,
+        };
+      }),
+      stats: {
+        totalUnits,
+        available,
+        dispatched,
+        onScene,
+        avgResponseTimeMin,
+        callsWaiting: this.callsQueue.size(),
+        avgWaitTimeMin,
+      },
       metrics: summarize(this.completedEvents, this.ambulances),
       eventLog: this.eventLog,
       scheduler: this.getSchedulerConfig(),

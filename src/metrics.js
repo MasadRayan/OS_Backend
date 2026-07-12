@@ -63,4 +63,66 @@ function summarize(completedEvents, ambulances, windowMinutes = 60) {
   };
 }
 
-module.exports = { summarize };
+function percentile(values, p) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = (p / 100) * (sorted.length - 1);
+  const lower = Math.floor(index);
+  const upper = Math.ceil(index);
+  if (lower === upper) return sorted[lower];
+  return Number((sorted[lower] * (upper - index) + sorted[upper] * (index - lower)).toFixed(1));
+}
+
+/**
+ * Response-time statistics computed from completed trip history.
+ * Returns { byHour, bySeverity, overall } with p50/p95 percentiles.
+ */
+function computeResponseTimeStats(tripHistory) {
+  const trips = tripHistory.filter((t) => t.status === 'arrived' && t.responseTimeMin > 0);
+
+  const bySeverityMap = {};
+  for (const trip of trips) {
+    const s = trip.severity;
+    if (!bySeverityMap[s]) bySeverityMap[s] = [];
+    bySeverityMap[s].push(trip.responseTimeMin);
+  }
+  const bySeverity = Object.entries(bySeverityMap)
+    .map(([severity, times]) => ({
+      severity: Number(severity),
+      count: times.length,
+      avgMinutes: Number((times.reduce((a, b) => a + b, 0) / times.length).toFixed(1)),
+      p50: percentile(times, 50),
+      p95: percentile(times, 95),
+    }))
+    .sort((a, b) => a.severity - b.severity);
+
+  const byHourMap = {};
+  for (const trip of trips) {
+    const hour = new Date(trip.dispatchedAt).getHours();
+    if (!byHourMap[hour]) byHourMap[hour] = [];
+    byHourMap[hour].push(trip.responseTimeMin);
+  }
+  const byHour = Object.entries(byHourMap)
+    .map(([hour, times]) => ({
+      hour: Number(hour),
+      count: times.length,
+      avgMinutes: Number((times.reduce((a, b) => a + b, 0) / times.length).toFixed(1)),
+      p50: percentile(times, 50),
+      p95: percentile(times, 95),
+    }))
+    .sort((a, b) => a.hour - b.hour);
+
+  const allTimes = trips.map((t) => t.responseTimeMin);
+  const overall = {
+    avgMinutes: allTimes.length
+      ? Number((allTimes.reduce((a, b) => a + b, 0) / allTimes.length).toFixed(1))
+      : 0,
+    p50: percentile(allTimes, 50),
+    p95: percentile(allTimes, 95),
+    totalTrips: allTimes.length,
+  };
+
+  return { byHour, bySeverity, overall };
+}
+
+module.exports = { summarize, computeResponseTimeStats, percentile };

@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { HospitalStore } = require('./src/store');
+const { computeResponseTimeStats } = require('./src/metrics');
 
 const PORT = process.env.PORT || 4000;
 
@@ -77,7 +78,35 @@ router.post('/ambulance/request', (req, res) => {
 
 router.post('/ambulance/:id/complete-trip', (req, res) => {
   const result = store.completeTrip(req.params.id);
-  res.json({ result, state: store.getState() });
+  if (!result.ok) return res.status(400).json(result);
+  res.json({ state: store.getState() });
+});
+
+router.post('/ambulance/:id/cancel', (req, res) => {
+  const result = store.cancelTrip(req.params.id, req.body && req.body.reason);
+  if (!result.ok) return res.status(400).json(result);
+  res.json({ state: store.getState() });
+});
+
+router.post('/ambulance/:id/reassign', (req, res) => {
+  const { targetAmbulanceId } = req.body || {};
+  if (!targetAmbulanceId) return res.status(400).json({ error: 'targetAmbulanceId is required' });
+  const result = store.reassignTrip(req.params.id, targetAmbulanceId);
+  if (!result.ok) return res.status(400).json(result);
+  res.json({ state: store.getState() });
+});
+
+router.get('/hospitals', (_req, res) => {
+  res.json(store.getHospitals());
+});
+
+router.get('/ambulance/history', (req, res) => {
+  const { from, to, ambulanceId, severity, status, page, limit } = req.query;
+  res.json(store.getTripHistory({ from, to, ambulanceId, severity, status, page, limit }));
+});
+
+router.get('/analysis/response-times', (_req, res) => {
+  res.json(computeResponseTimeStats(store.tripHistory));
 });
 
 app.use('/api', router);
