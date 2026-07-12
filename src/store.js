@@ -241,6 +241,35 @@ class HospitalStore {
     return { ok: true };
   }
 
+  /** Immediately transfer a critical/serious patient from ER to ICU, bypassing the auto-progression timer. */
+  transferToIcu(patientId) {
+    const patient = this.admitted.get(patientId);
+    if (!patient) return { ok: false, reason: 'not_found' };
+    if (patient.department !== 'ER') return { ok: false, reason: 'not_in_er' };
+    if (patient.basePriority > 2) return { ok: false, reason: 'not_critical_enough' };
+
+    const nextDepartment = 'ICU';
+    const newAllocation = stageAllocation(nextDepartment, patient.basePriority);
+    const result = this.resourcePool.transfer(patient.id, newAllocation, patient.maxClaim);
+
+    if (!result.granted) {
+      this.log(
+        `${patient.name}'s immediate transfer to ICU BLOCKED (${result.reason})`
+      );
+      return { ok: false, reason: result.reason };
+    }
+
+    const now = Date.now();
+    patient.department = nextDepartment;
+    patient.allocation = newAllocation;
+    patient.stageStartedAt = now;
+    patient.dischargeAt = now + stageBurstMinutes(nextDepartment, patient.basePriority) * 60000;
+    patient.transferBlocked = false;
+
+    this.log(`${patient.name} immediately transferred from ER to ICU`);
+    return { ok: true };
+  }
+
   // ---------- Multilevel queue pipeline: escalation + department transitions ----------
 
   /** Condition auto-escalation: patients waiting too long without treatment get worse. */

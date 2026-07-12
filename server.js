@@ -67,6 +67,12 @@ router.post('/patients/:id/discharge', (req, res) => {
   res.json({ result, state: store.getState() });
 });
 
+router.post('/patients/:id/transfer-to-icu', (req, res) => {
+  const result = store.transferToIcu(req.params.id);
+  if (!result.ok) return res.status(400).json(result);
+  res.json({ result, state: store.getState() });
+});
+
 router.post('/ambulance/request', (req, res) => {
   const { callerName, lat, lng, severity, note } = req.body || {};
   if (!callerName || lat == null || lng == null || !severity) {
