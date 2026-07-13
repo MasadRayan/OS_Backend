@@ -69,7 +69,6 @@ router.post('/patients/:id/discharge', (req, res) => {
 
 router.post('/patients/:id/transfer-to-icu', (req, res) => {
   const result = store.transferToIcu(req.params.id);
-  if (!result.ok) return res.status(400).json(result);
   res.json({ result, state: store.getState() });
 });
 
