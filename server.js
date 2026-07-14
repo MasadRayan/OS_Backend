@@ -6,7 +6,10 @@ const { computeResponseTimeStats } = require('./src/metrics');
 const PORT = process.env.PORT || 4000;
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+}));
 app.use(express.json());
 
 const store = new HospitalStore();
